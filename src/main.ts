@@ -1,4 +1,5 @@
-import { tool, webSearchTool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
+import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
+import { webSearchTool } from "@openai/agents-openai";
 import { z } from "zod";
 import { OpenAI } from "openai";
 import { runGuardrails } from "@openai/guardrails";
