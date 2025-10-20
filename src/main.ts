@@ -1,20 +1,8 @@
-import { tool, Agent, AgentInputItem, Runner, withTrace } from "@openai/agents";
-import { webSearchTool } from "@openai/agents-openai";
-import { z } from "zod";
-import { OpenAI } from "openai";
-import { runGuardrails } from "@openai/guardrails";
+import { runGuardrails } from "./guardrails.js";
 
 // ---------- Config ----------
-const ALLOWED_DOMAINS = (process.env.ALLOWED_LISTING_DOMAINS ??
-  "centris.ca,realtor.ca,royallepage.ca,remax-quebec.com,duproprio.com")
-  .split(",")
-  .map(d => d.trim().toLowerCase())
-  .filter(Boolean);
-
-const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS ?? "10000");
-
-// ---------- Shared client for guardrails ----------
-const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const DEFAULT_LOCATION = "Laval, QC";
+const MAX_LISTINGS = 12;
 
 // ---------- Guardrails ----------
 const guardrailsConfig = {
@@ -41,18 +29,12 @@ const guardrailsConfig = {
     },
   ],
 };
-const context = { guardrailLlm: client };
+const context = {};
 
 function guardrailsHasTripwire(results: any[]) {
   return (results ?? []).some((r) => r?.tripwireTriggered === true);
 }
-function getGuardrailSafeText(results: any[], fallbackText: string) {
-  for (const r of results ?? []) {
-    if (r?.info && "checked_text" in r.info) return r.info.checked_text ?? fallbackText;
-  }
-  const pii = (results ?? []).find((r) => r?.info && "anonymized_text" in r.info);
-  return pii?.info?.anonymized_text ?? fallbackText;
-}
+
 function buildGuardrailFailOutput(results: any[]) {
   const get = (name: string) =>
     (results ?? []).find((r) => {
@@ -94,7 +76,6 @@ function buildGuardrailFailOutput(results: any[]) {
 }
 
 // ---------- Utility helpers ----------
-const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
 function numberFromPriceLike(s?: string | null) {
   if (!s) return null;
   const raw = s.replace(/[^\d]/g, "");
@@ -102,366 +83,170 @@ function numberFromPriceLike(s?: string | null) {
   const n = Number(raw);
   return Number.isFinite(n) ? n : null;
 }
+
 function first<T>(...vals: Array<T | null | undefined>) {
   return vals.find((v) => v != null) ?? null;
 }
-function domainAllowed(url: string) {
-  try {
-    const u = new URL(url);
-    const host = u.hostname.toLowerCase();
-    return ALLOWED_DOMAINS.some((d) => host === d || host.endsWith("." + d));
-  } catch {
-    return false;
-  }
+
+function toCleanString(value: unknown) {
+  return typeof value === "string" ? value.trim() : "";
 }
 
-// ---------- Tools ----------
-const normalizeAndDedupeListings = tool({
-  name: "normalizeAndDedupeListings",
-  description:
-    "Normalize listings, deduplicate by MLS, trim text fields, normalize prices to numbers, and cap results to 12.",
-  parameters: z.object({
-    listings: z.array(z.record(z.any())),
-  }),
-  execute: async (input: { listings: Record<string, any>[] }) => {
-    const seen: Record<string, number> = {};
-    const out: any[] = [];
+type NormalizedListing = {
+  mls: string;
+  url: string | null;
+  address: string | null;
+  price: number | null;
+  beds: number | null;
+  baths: number | null;
+  type: string | null;
+  note_fr: string | null;
+  note_en: string | null;
+};
 
-    for (const item of input.listings ?? []) {
-      const mlsRaw =
-        first(item.mls, item.MLS, item.listingId, item.listing_id, item["MLS®"]) ?? null;
-      const mls = mlsRaw ? String(mlsRaw).trim() : null;
+function normalizeAndDedupeListings(items: unknown[]): NormalizedListing[] {
+  const seen = new Map<string, number>();
+  const out: NormalizedListing[] = [];
 
-      const url: string | null = item.url ? String(item.url).trim() : null;
-      const address: string | null = item.address ? String(item.address).trim() : null;
-      const beds: number | null =
-        item.beds != null ? Number(String(item.beds).replace(/[^\d]/g, "")) : null;
-      const baths: number | null =
-        item.baths != null ? Number(String(item.baths).replace(/[^\d.]/g, "")) : null;
-      const type: string | null = item.type ? String(item.type).trim() : null;
-      const note_fr: string | null = item.note_fr ? String(item.note_fr).trim() : null;
-      const note_en: string | null = item.note_en ? String(item.note_en).trim() : null;
+  for (const item of items ?? []) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, any>;
 
-      const price =
-        item.price != null
-          ? Number(item.price)
-          : numberFromPriceLike(first(item.priceText, item.price_str, item.askingPrice));
+    const mlsRaw =
+      first(record.mls, record.MLS, record.listingId, record.listing_id, record["MLS®"]) ?? null;
+    const mls = mlsRaw ? String(mlsRaw).trim() : null;
 
-      const normalized = {
-        mls: mls ?? "MLS non trouvé / MLS not found",
-        url,
-        address,
-        price,
-        beds,
-        baths,
-        type,
-        note_fr: note_fr ?? null,
-        note_en: note_en ?? null,
-      };
+    const url = record.url ? String(record.url).trim() : null;
+    const address = record.address ? String(record.address).trim() : null;
+    const beds =
+      record.beds != null ? Number(String(record.beds).replace(/[^\d]/g, "")) : null;
+    const baths =
+      record.baths != null ? Number(String(record.baths).replace(/[^\d.]/g, "")) : null;
+    const type = record.type ? String(record.type).trim() : null;
+    const note_fr = record.note_fr ? String(record.note_fr).trim() : null;
+    const note_en = record.note_en ? String(record.note_en).trim() : null;
 
-      const key = mls ? `MLS:${mls.toUpperCase()}` : url ? `URL:${url}` : `IDX:${out.length}`;
-      if (seen[key] == null) {
-        seen[key] = out.length;
-        out.push(normalized);
-      } else {
-        const idx = seen[key];
-        const prior = out[idx];
-        out[idx] = {
-          ...prior,
-          address: prior.address ?? normalized.address,
-          price: prior.price ?? normalized.price,
-          beds: prior.beds ?? normalized.beds,
-          baths: prior.baths ?? normalized.baths,
-          type: prior.type ?? normalized.type,
-          note_fr: prior.note_fr ?? normalized.note_fr,
-          note_en: prior.note_en ?? normalized.note_en,
-        };
-      }
+    const price =
+      record.price != null
+        ? Number(record.price)
+        : numberFromPriceLike(first(record.priceText, record.price_str, record.askingPrice));
 
-      if (out.length >= 12) break;
-    }
-
-    return { listings: out.slice(0, 12) };
-  },
-});
-
-const fetchHtmlPage = tool({
-  name: "fetchHtmlPage",
-  description: "Fetch an HTML listing page with desktop User-Agent, timeout, and retries",
-  parameters: z.object({ url: z.string().url() }),
-  execute: async ({ url }: { url: string }) => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-    const headers = {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    };
-    let lastErr: any = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = await fetch(url, { headers, signal: controller.signal as any });
-        clearTimeout(timer);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const html = await res.text();
-        return { url, html };
-      } catch (e) {
-        lastErr = e;
-        await sleep(300 + attempt * 500);
-      }
-    }
-    throw new Error(`fetchHtmlPage failed for ${url}: ${String(lastErr)}`);
-  },
-});
-
-const extractListingInfo = tool({
-  name: "extractListingInfo",
-  description:
-    "Extract MLS or listing ID, address, price, beds, baths, and property type from supplied HTML or a URL for a real estate listing.",
-  parameters: z.object({
-    url: z.string().url().optional().default(""),
-    html: z.string(),
-  }),
-  execute: async ({ url = "", html }: { url?: string; html: string }) => {
-    const mlsPatterns = [
-      /MLS[®™]?\s*#?\s*[:\-]?\s*([A-Z0-9\-]+)/i,
-      /Num(é|e)ro\s+Centris\s*[:\-]?\s*([0-9\-]+)/i,
-      /Centris\s*#\s*([0-9\-]+)/i,
-      /Listing\s*ID\s*[:\-]?\s*([A-Z0-9\-]+)/i,
-      /ID\s*[:\-]?\s*([A-Z0-9\-]{5,})/i,
-    ];
-    const pricePatterns = [
-      /\$[\s]*[0-9][0-9,.\s]*/g,
-      /Prix\s*[:\-]?\s*\$[\s]*[0-9][0-9,.\s]*/gi,
-      /Asking\s*Price\s*[:\-]?\s*\$[\s]*[0-9][0-9,.\s]*/gi,
-    ];
-    const addressPatterns = [
-      /property-address[^>]*>\s*([^<]+)</i,
-      /"address"\s*:\s*"([^"]+)"/i,
-      /<meta[^>]+property="og:street-address"[^>]+content="([^"]+)"/i,
-      /itemprop="streetAddress"[^>]*>\s*([^<]+)</i,
-      /<h1[^>]*class="[^"]*(address|street)[^"]*"[^>]*>\s*([^<]+)</i,
-    ];
-    const bedsPatterns = [/(\d+)\s*(?:ch|chambres|beds|bedrooms)\b/i, /"bedrooms"\s*:\s*(\d+)/i];
-    const bathsPatterns = [
-      /(\d+(\.\d+)?)\s*(?:sdb|salles?\s*de\s*bain|baths?)\b/i,
-      /"bathrooms"\s*:\s*(\d+(\.\d+)?)/i,
-    ];
-    const typePatterns = [
-      /(maison|house|condo|copropri(é|e)t(é|e)|multiplex|plex|terrain|land|commercial)/i,
-      /"propertyType"\s*:\s*"([^"]+)"/i,
-    ];
-    const findFirst = (patterns: RegExp[], text: string) => {
-      for (const re of patterns) {
-        const m = re.exec(text);
-        if (m) return m[1] ?? m[0];
-      }
-      return null;
-    };
-    const findAll = (re: RegExp, text: string) => {
-      const out: string[] = [];
-      let m: RegExpExecArray | null;
-      while ((m = re.exec(text))) out.push(m[0]);
-      return out;
-    };
-
-    const mls = findFirst(mlsPatterns, html) ?? null;
-    let price: number | null = null;
-    for (const pat of pricePatterns) {
-      const hits = findAll(pat, html);
-      if (hits.length) {
-        price = numberFromPriceLike(hits[0]);
-        if (price != null) break;
-      }
-    }
-
-    const address = findFirst(addressPatterns, html) ?? null;
-    const bedsRaw = findFirst(bedsPatterns, html);
-    const bathsRaw = findFirst(bathsPatterns, html);
-    const typeRaw = findFirst(typePatterns, html);
-
-    const beds = bedsRaw ? Number(String(bedsRaw).replace(/[^\d]/g, "")) : null;
-    const baths = bathsRaw ? Number(String(bathsRaw).replace(/[^\d.]/g, "")) : null;
-    const type = typeRaw ? String(typeRaw).toLowerCase() : null;
-
-    return {
+    const normalized: NormalizedListing = {
       mls: mls ?? "MLS non trouvé / MLS not found",
-      url: url || null,
+      url,
       address,
-      price,
+      price: price ?? null,
       beds,
       baths,
       type,
+      note_fr: note_fr ?? null,
+      note_en: note_en ?? null,
     };
-  },
-});
 
-const searchRealEstateListings = tool({
-  name: "searchRealEstateListings",
-  description:
-    "Search for real estate listing URLs from major Canadian platforms using SerpAPI and filter results to allowed domains.",
-  parameters: z.object({
-    q: z.string(),
-    num: z.number().int().min(1).max(20).default(10),
-  }),
-  execute: async ({ q, num }: { q: string; num: number }) => {
-    const key = process.env.SERPAPI_KEY;
-    if (!key) throw new Error("SERPAPI_KEY env var is required for searchRealEstateListings.");
-    const url = new URL("https://serpapi.com/search.json");
-    url.searchParams.set("engine", "google");
-    url.searchParams.set("q", q);
-    url.searchParams.set("num", String(num));
-    url.searchParams.set("hl", "fr");
-    url.searchParams.set("gl", "ca");
-    url.searchParams.set("api_key", key);
-    const res = await fetch(url.toString());
-    if (!res.ok) throw new Error(`SerpAPI HTTP ${res.status}`);
-    const data = await res.json();
-
-    const results: string[] = [];
-    const candidates = [
-      ...(data.organic_results ?? []),
-      ...(data.inline_shopping_results ?? []),
-      ...(data.shopping_results ?? []),
-    ];
-    for (const r of candidates) {
-      const u = r.link ?? r.product_link ?? r.source ?? null;
-      if (!u) continue;
-      if (domainAllowed(u)) results.push(u);
-      if (results.length >= num) break;
+    const key = mls ? `MLS:${mls.toUpperCase()}` : url ? `URL:${url}` : `IDX:${out.length}`;
+    if (!seen.has(key)) {
+      seen.set(key, out.length);
+      out.push(normalized);
+    } else {
+      const idx = seen.get(key)!;
+      const prior = out[idx];
+      out[idx] = {
+        ...prior,
+        address: prior.address ?? normalized.address,
+        price: prior.price ?? normalized.price,
+        beds: prior.beds ?? normalized.beds,
+        baths: prior.baths ?? normalized.baths,
+        type: prior.type ?? normalized.type,
+        note_fr: prior.note_fr ?? normalized.note_fr,
+        note_en: prior.note_en ?? normalized.note_en,
+      };
     }
-    return { q, num, results };
-  },
-});
 
-const webSearchPreview = webSearchTool({
-  searchContextSize: "medium",
-  userLocation: { country: "CA", type: "approximate" },
-});
+    if (out.length >= MAX_LISTINGS) break;
+  }
 
-// ---------- Output schema ----------
-const ListingFinderSchema = z.object({
-  title: z.string(),
-  criteria: z.object({
-    location: z.string(),
-    priceMin: z.string(),
-    priceMax: z.string(),
-    beds: z.string(),
-    baths: z.string(),
-    type: z.string(),
-    keywords: z.string(),
-  }),
-  typeOptions: z.array(z.object({ value: z.string(), label: z.string() })),
-  bedsOptions: z.array(z.object({ value: z.string(), label: z.string() })),
-  bathsOptions: z.array(z.object({ value: z.string(), label: z.string() })),
-  hasResults: z.boolean(),
-  resultsJson: z.string(),
-});
-
-// ---------- Agent ----------
-const listingFinder = new Agent({
-  name: "LISTING FINDER",
-  instructions: `You are “Listings Finder”, a bilingual (FR first, then EN) real-estate agent assistant for Québec.
-
-GOAL
-- Given search criteria (location, budget, beds/baths, property type, keywords), browse public sites (Centris, Realtor.ca, Royal LePage, RE/MAX Québec, DuProprio) and return 5–12 currently-listed properties.
-- For each property, include: MLS/Listing number (if present), URL, address (or building/area label), asking price (CAD), beds, baths, property type, and a one-line note.
-- When multiple pages point to the same MLS, **dedupe** by MLS (keep the most complete record).
-
-SAFETY & SOURCES
-- Use only public information (no paywalled/forbidden content). Respect site TOS and robots (fetch gently).
-- If MLS is not visible on a page, say “MLS non trouvé / MLS not found” instead of hallucinating.
-- Never imply MLS/Centris insider access—these are public storefront pages.
-
-STYLE
-- Output FR first, then EN. Keep it concise and client-ready.
-- If fewer than 3 matches, say so and offer a next step (expand area/price/filters).
-
-The widget is expecting this data format:
-{
-  title: 'Québec Listings • Annonces Québec',
-  criteria: { location: 'Montréal, QC', priceMin: '', priceMax: '', beds: '', baths: '', type: '', keywords: '' },
-  typeOptions: [
-    { value: '', label: 'Any type / Tout type' },
-    { value: 'house', label: 'House / Maison' },
-    { value: 'condo', label: 'Condo / Copropriété' },
-    { value: 'multiplex', label: 'Multiplex / Plex' },
-    { value: 'land', label: 'Land / Terrain' },
-    { value: 'commercial', label: 'Commercial' }
-  ],
-  bedsOptions: [
-    { value: '', label: 'Beds: Any / Chambres: Peu importe' },
-    { value: '1', label: '1+' }, { value: '2', label: '2+' }, { value: '3', label: '3+' },
-    { value: '4', label: '4+' }, { value: '5', label: '5+' }
-  ],
-  bathsOptions: [
-    { value: '', label: 'Baths: Any / Salles de bain: Peu importe' },
-    { value: '1', label: '1+' }, { value: '2', label: '2+' }, { value: '3', label: '3+' }
-  ],
-  hasResults: false,
-  resultsJson: '```json\\n{\\n  "listings": [],\\n  "schema": { "mls": "string", "url": "string", "price": "number (CAD)", "note_en": "string", "note_fr": "string" }\\n}\\n```'
+  return out.slice(0, MAX_LISTINGS);
 }
 
-RULES
-- Normalize incoming criteria; fill sensible defaults (ex: Laval, QC if missing).
-- Prefer pages that (a) look like a listing detail and (b) show an MLS or listing ID.
-- Don’t invent prices/addresses—leave null if not visible.
-- Never exceed 12 listings unless asked.
-`,
-  model: "gpt-5",
-  tools: [
-    normalizeAndDedupeListings,
-    extractListingInfo,
-    fetchHtmlPage,
-    searchRealEstateListings,
-    webSearchPreview,
-  ],
-  outputType: ListingFinderSchema,
-  modelSettings: {
-    parallelToolCalls: true,
-    reasoning: { effort: "low", summary: "auto" },
-    store: true,
-  },
-});
+function buildResultsJson(listings: NormalizedListing[]) {
+  const payload = {
+    listings,
+    schema: {
+      mls: "string",
+      url: "string",
+      price: "number (CAD)",
+      note_en: "string",
+      note_fr: "string",
+    },
+  };
+  const body = JSON.stringify(payload, null, 2);
+  return "'" + "```json\n" + body + "\n```'";
+}
+
+const TYPE_OPTIONS = [
+  { value: "", label: "Any type / Tout type" },
+  { value: "house", label: "House / Maison" },
+  { value: "condo", label: "Condo / Copropriété" },
+  { value: "multiplex", label: "Multiplex / Plex" },
+  { value: "land", label: "Land / Terrain" },
+  { value: "commercial", label: "Commercial" },
+];
+
+const BEDS_OPTIONS = [
+  { value: "", label: "Beds: Any / Chambres: Peu importe" },
+  { value: "1", label: "1+" },
+  { value: "2", label: "2+" },
+  { value: "3", label: "3+" },
+  { value: "4", label: "4+" },
+  { value: "5", label: "5+" },
+];
+
+const BATHS_OPTIONS = [
+  { value: "", label: "Baths: Any / Salles de bain: Peu importe" },
+  { value: "1", label: "1+" },
+  { value: "2", label: "2+" },
+  { value: "3", label: "3+" },
+];
 
 // ---------- Workflow ----------
 type WorkflowInput = {
   input_as_text: string;
-  input_variables?: Record<string, string>;
+  input_variables?: Record<string, unknown>;
 };
 
 export const runWorkflow = async (workflow: WorkflowInput) => {
-  return await withTrace("Property matcher", async () => {
-    // Merge variables into a helper preface so the agent can use them deterministically
-    const variablesPreface =
-      workflow.input_variables && Object.keys(workflow.input_variables).length
-        ? `\n\n[VARIABLES]\n${JSON.stringify(workflow.input_variables)}`
-        : "";
+  const guardrailsInputtext = workflow.input_as_text ?? "";
+  const guardrailsResult = await runGuardrails(guardrailsInputtext, guardrailsConfig as any, context as any);
+  if (guardrailsHasTripwire(guardrailsResult as any[])) {
+    return buildGuardrailFailOutput(guardrailsResult as any[]);
+  }
 
-    const conversationHistory: AgentInputItem[] = [
-      { role: "user", content: [{ type: "input_text", text: (workflow.input_as_text ?? "") + variablesPreface }] },
-    ];
+  const variables = workflow.input_variables ?? {};
+  const criteria = {
+    location: toCleanString(variables.location) || DEFAULT_LOCATION,
+    priceMin: toCleanString(variables.priceMin),
+    priceMax: toCleanString(variables.priceMax),
+    beds: toCleanString(variables.beds),
+    baths: toCleanString(variables.baths),
+    type: toCleanString(variables.type),
+    keywords: toCleanString(variables.keywords || workflow.input_as_text),
+  };
 
-    // Guardrails
-    const guardrailsInputtext = workflow.input_as_text;
-    const guardrailsResult = await runGuardrails(guardrailsInputtext, guardrailsConfig as any, context as any);
-    const guardrailsHastripwire = guardrailsHasTripwire(guardrailsResult as any[]);
-    if (guardrailsHastripwire) return buildGuardrailFailOutput(guardrailsResult as any[]);
+  const listingsInput = Array.isArray((variables as any).listings) ? (variables as any).listings : [];
+  const listings = normalizeAndDedupeListings(listingsInput);
 
-    const runner = new Runner({
-      traceMetadata: {
-        __trace_source__: "agent-builder",
-        workflow_id: "wf_self_hosted_listing_finder",
-      },
-    });
+  const output = {
+    title: "Québec Listings • Annonces Québec",
+    criteria,
+    typeOptions: TYPE_OPTIONS,
+    bedsOptions: BEDS_OPTIONS,
+    bathsOptions: BATHS_OPTIONS,
+    hasResults: listings.length > 0,
+    resultsJson: buildResultsJson(listings),
+  };
 
-    const resultTemp = await runner.run(listingFinder, [...conversationHistory]);
-    if (!resultTemp.finalOutput) throw new Error("Agent result is undefined");
-
-    return {
-      output_text: JSON.stringify(resultTemp.finalOutput),
-      output_parsed: resultTemp.finalOutput,
-      // convenience: try to expose listings if your agent puts them inside resultsJson
-    };
-  });
+  return {
+    output_text: JSON.stringify(output),
+    output_parsed: output,
+  };
 };
