@@ -1,4 +1,5 @@
 import { runGuardrails } from "./guardrails.js";
+import { runListingAgent, type ListingCriteria } from "./agent.js";
 
 // ---------- Config ----------
 const DEFAULT_LOCATION = "Laval, QC";
@@ -102,6 +103,7 @@ type NormalizedListing = {
   type: string | null;
   note_fr: string | null;
   note_en: string | null;
+  source: string | null;
 };
 
 function normalizeAndDedupeListings(items: unknown[]): NormalizedListing[] {
@@ -125,6 +127,7 @@ function normalizeAndDedupeListings(items: unknown[]): NormalizedListing[] {
     const type = record.type ? String(record.type).trim() : null;
     const note_fr = record.note_fr ? String(record.note_fr).trim() : null;
     const note_en = record.note_en ? String(record.note_en).trim() : null;
+    const source = record.source ? String(record.source).trim() : null;
 
     const price =
       record.price != null
@@ -141,6 +144,7 @@ function normalizeAndDedupeListings(items: unknown[]): NormalizedListing[] {
       type,
       note_fr: note_fr ?? null,
       note_en: note_en ?? null,
+      source: source ?? null,
     };
 
     const key = mls ? `MLS:${mls.toUpperCase()}` : url ? `URL:${url}` : `IDX:${out.length}`;
@@ -159,6 +163,7 @@ function normalizeAndDedupeListings(items: unknown[]): NormalizedListing[] {
         type: prior.type ?? normalized.type,
         note_fr: prior.note_fr ?? normalized.note_fr,
         note_en: prior.note_en ?? normalized.note_en,
+        source: prior.source ?? normalized.source,
       };
     }
 
@@ -173,10 +178,15 @@ function buildResultsJson(listings: NormalizedListing[]) {
     listings,
     schema: {
       mls: "string",
+      address: "string",
       url: "string",
       price: "number (CAD)",
+      beds: "number",
+      baths: "number",
+      type: "string",
       note_en: "string",
       note_fr: "string",
+      source: "string",
     },
   };
   const body = JSON.stringify(payload, null, 2);
@@ -222,7 +232,7 @@ export const runWorkflow = async (workflow: WorkflowInput) => {
   }
 
   const variables = workflow.input_variables ?? {};
-  const criteria = {
+  const criteria: ListingCriteria = {
     location: toCleanString(variables.location) || DEFAULT_LOCATION,
     priceMin: toCleanString(variables.priceMin),
     priceMax: toCleanString(variables.priceMax),
@@ -233,7 +243,9 @@ export const runWorkflow = async (workflow: WorkflowInput) => {
   };
 
   const listingsInput = Array.isArray((variables as any).listings) ? (variables as any).listings : [];
-  const listings = normalizeAndDedupeListings(listingsInput);
+  const agentResults = await runListingAgent(workflow.input_as_text, criteria);
+  const combinedListings = [...listingsInput, ...(agentResults.listings ?? [])];
+  const listings = normalizeAndDedupeListings(combinedListings);
 
   const output = {
     title: "Québec Listings • Annonces Québec",
@@ -243,6 +255,14 @@ export const runWorkflow = async (workflow: WorkflowInput) => {
     bathsOptions: BATHS_OPTIONS,
     hasResults: listings.length > 0,
     resultsJson: buildResultsJson(listings),
+    listings,
+    agentNotes: {
+      en: agentResults.notes_en,
+      fr: agentResults.notes_fr,
+    },
+    sources: agentResults.sources,
+    warnings: agentResults.warnings,
+    rawAgentResponse: agentResults.rawResponse,
   };
 
   return {
